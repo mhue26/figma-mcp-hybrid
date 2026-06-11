@@ -1,0 +1,6 @@
+node_modules/
+.cursor/
+.env
+dist/
+docs/
+.DS_Store

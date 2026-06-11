@@ -1,0 +1,25 @@
+{
+  "name": "Cursor MCP Plugin",
+  "id": "1485687494525374295",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": [
+    "figma",
+    "figjam"
+  ],
+  "permissions": [],
+  "networkAccess": {
+    "allowedDomains": [
+      "ws://localhost:3055",
+      "https://www.google-analytics.com"
+    ],
+    "reasoning": "Connects to a local Cursor MCP relay; sends anonymous usage events to Google Analytics.",
+    "devAllowedDomains": [
+      "http://localhost:3055",
+      "ws://localhost:3055",
+      "https://www.google-analytics.com"
+    ]
+  },
+  "documentAccess": "dynamic-page"
+}

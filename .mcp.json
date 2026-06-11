@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "figma-hybrid": {
+      "command": "npx",
+      "args": ["tsx", "src/talk_to_figma_mcp/server.ts"],
+      "env": {
+        "FIGMA_TOKEN": "your-figma-personal-access-token"
+      }
+    }
+  }
+}
