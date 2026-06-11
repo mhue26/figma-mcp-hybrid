@@ -29,6 +29,8 @@ const expected = [
   "get_figma_comments",
   "post_figma_comment",
   "get_figma_images",
+  "figma_cache_stats",
+  "figma_cache_clear",
   "join_channel",
   "create_frame",
   "set_fill_color",

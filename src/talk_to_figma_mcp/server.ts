@@ -5,7 +5,15 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import WebSocket from "ws";
 import { v4 as uuidv4 } from "uuid";
-import { figmaGet, figmaPost, hasFigmaToken } from "../figma-api.js";
+import {
+  figmaGet,
+  figmaPost,
+  hasFigmaToken,
+  getCacheStats,
+  clearDiskCache,
+  parseDuration,
+  type FigmaGetResult,
+} from "../figma-api.js";
 
 // Define TypeScript interfaces for Figma responses
 interface FigmaResponse {
@@ -87,10 +95,23 @@ const serverUrl = serverArg ? serverArg.split('=')[1] : 'localhost';
 const WS_URL = serverUrl === 'localhost' ? `ws://${serverUrl}` : `wss://${serverUrl}`;
 
 // ---------------------------------------------------------------------------
-// REST API read tools (work on ANY Figma file by key, with TTL caching).
-// These complement the plugin-based tools below, which only see the file
-// currently open in Figma Desktop. All require FIGMA_TOKEN in the env.
+// REST API read tools (work on ANY Figma file by key).
+//
+// Rate-limit hardening: every read goes through a persistent disk cache, a
+// per-tier throttle, request coalescing, and 429/Retry-After backoff, and falls
+// back to stale cache on failure (see ../figma-api.ts).
+//
+// PREFER the plugin tools below when the file is open in Figma Desktop: they
+// read via the Plugin API and make ZERO REST calls (no rate limit, no token).
+// Use these REST tools for files that are NOT open locally.
 // ---------------------------------------------------------------------------
+
+// Per-endpoint cache TTLs. Image render URLs expire quickly, so keep them short.
+const TTL_FILE = parseDuration(process.env.FIGMA_CACHE_TTL, 86_400_000); // 24h default
+const TTL_IMAGES = parseDuration(process.env.FIGMA_IMAGE_CACHE_TTL, 3_600_000); // 1h
+
+const PLUGIN_HINT =
+  " If this file is open in Figma Desktop, prefer the plugin tools (get_document_info, read_my_design, get_node_info) which have no rate limit. Requires FIGMA_TOKEN.";
 
 function textResult(data: unknown) {
   return {
@@ -100,6 +121,19 @@ function textResult(data: unknown) {
         text: typeof data === "string" ? data : JSON.stringify(data, null, 2),
       },
     ],
+  };
+}
+
+// Render a hardened GET result, prefixing a note when the data is cached/stale.
+function restResult(result: FigmaGetResult<unknown>, payload: unknown) {
+  const body = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
+  const prefix = result.stale
+    ? `[STALE] ${result.note ?? "Served from cache; a fresh fetch failed."}\n\n`
+    : result.cached
+      ? "[cache hit]\n\n"
+      : "";
+  return {
+    content: [{ type: "text" as const, text: prefix + body }],
   };
 }
 
@@ -115,12 +149,20 @@ function restError(error: unknown) {
   };
 }
 
+const forceRefreshField = {
+  forceRefresh: z
+    .boolean()
+    .optional()
+    .describe("Bypass the cache and fetch fresh data (counts against the rate limit)"),
+};
+
 server.registerTool(
   "get_figma_file",
   {
     title: "Get Figma File",
     description:
-      "Get a Figma file's document tree via the REST API. Reads any file by key (no need to open it in Figma). Keep depth low (default 2) to avoid huge responses. Requires FIGMA_TOKEN.",
+      "Get a Figma file's document tree via the REST API (Tier 1, cached). Reads any file by key (no need to open it in Figma). Keep depth low (default 2) to avoid huge responses." +
+      PLUGIN_HINT,
     inputSchema: {
       fileKey: z.string().describe("The Figma file key (from the file URL)"),
       depth: z
@@ -130,17 +172,30 @@ server.registerTool(
         .max(4)
         .optional()
         .describe("Tree depth to fetch; defaults to 2"),
+      ...forceRefreshField,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ fileKey, depth }: { fileKey: string; depth?: number }) => {
+  async ({
+    fileKey,
+    depth,
+    forceRefresh,
+  }: {
+    fileKey: string;
+    depth?: number;
+    forceRefresh?: boolean;
+  }) => {
     try {
       const d = depth ?? 2;
-      const data = await figmaGet<any>(`/files/${fileKey}?depth=${d}`);
-      return textResult({
-        name: data.name,
-        lastModified: data.lastModified,
-        document: data.document,
+      const res = await figmaGet<any>(`/files/${fileKey}?depth=${d}`, {
+        tier: 1,
+        ttlMs: TTL_FILE,
+        forceRefresh,
+      });
+      return restResult(res, {
+        name: res.data.name,
+        lastModified: res.data.lastModified,
+        document: res.data.document,
       });
     } catch (error) {
       return restError(error);
@@ -153,19 +208,30 @@ server.registerTool(
   {
     title: "Get Figma Nodes",
     description:
-      "Get specific nodes by ID from a Figma file via the REST API. Prefer this over fetching the whole file for targeted inspection. Requires FIGMA_TOKEN.",
+      "Get specific nodes by ID from a Figma file via the REST API (Tier 1, cached). Prefer this over fetching the whole file for targeted inspection." +
+      PLUGIN_HINT,
     inputSchema: {
       fileKey: z.string().describe("The Figma file key"),
       nodeIds: z.string().describe("Comma-separated node IDs"),
+      ...forceRefreshField,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ fileKey, nodeIds }: { fileKey: string; nodeIds: string }) => {
+  async ({
+    fileKey,
+    nodeIds,
+    forceRefresh,
+  }: {
+    fileKey: string;
+    nodeIds: string;
+    forceRefresh?: boolean;
+  }) => {
     try {
-      const data = await figmaGet<any>(
-        `/files/${fileKey}/nodes?ids=${encodeURIComponent(nodeIds)}`
+      const res = await figmaGet<any>(
+        `/files/${fileKey}/nodes?ids=${encodeURIComponent(nodeIds)}`,
+        { tier: 1, ttlMs: TTL_FILE, forceRefresh }
       );
-      return textResult(data.nodes ?? {});
+      return restResult(res, res.data.nodes ?? {});
     } catch (error) {
       return restError(error);
     }
@@ -177,14 +243,22 @@ server.registerTool(
   {
     title: "Get Figma Components",
     description:
-      "List published components in a Figma file via the REST API. Requires FIGMA_TOKEN.",
-    inputSchema: { fileKey: z.string().describe("The Figma file key") },
+      "List published components in a Figma file via the REST API (Tier 3, cached)." +
+      PLUGIN_HINT,
+    inputSchema: {
+      fileKey: z.string().describe("The Figma file key"),
+      ...forceRefreshField,
+    },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ fileKey }: { fileKey: string }) => {
+  async ({ fileKey, forceRefresh }: { fileKey: string; forceRefresh?: boolean }) => {
     try {
-      const data = await figmaGet<any>(`/files/${fileKey}/components`);
-      return textResult(data.meta?.components ?? []);
+      const res = await figmaGet<any>(`/files/${fileKey}/components`, {
+        tier: 3,
+        ttlMs: TTL_FILE,
+        forceRefresh,
+      });
+      return restResult(res, res.data.meta?.components ?? []);
     } catch (error) {
       return restError(error);
     }
@@ -196,14 +270,22 @@ server.registerTool(
   {
     title: "Get Figma Styles",
     description:
-      "List styles (colors, text, effects, grids) in a Figma file via the REST API. Requires FIGMA_TOKEN.",
-    inputSchema: { fileKey: z.string().describe("The Figma file key") },
+      "List styles (colors, text, effects, grids) in a Figma file via the REST API (Tier 3, cached)." +
+      PLUGIN_HINT,
+    inputSchema: {
+      fileKey: z.string().describe("The Figma file key"),
+      ...forceRefreshField,
+    },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ fileKey }: { fileKey: string }) => {
+  async ({ fileKey, forceRefresh }: { fileKey: string; forceRefresh?: boolean }) => {
     try {
-      const data = await figmaGet<any>(`/files/${fileKey}/styles`);
-      return textResult(data.meta?.styles ?? []);
+      const res = await figmaGet<any>(`/files/${fileKey}/styles`, {
+        tier: 3,
+        ttlMs: TTL_FILE,
+        forceRefresh,
+      });
+      return restResult(res, res.data.meta?.styles ?? []);
     } catch (error) {
       return restError(error);
     }
@@ -214,14 +296,22 @@ server.registerTool(
   "get_figma_comments",
   {
     title: "Get Figma Comments",
-    description: "Get all comments on a Figma file via the REST API. Requires FIGMA_TOKEN.",
-    inputSchema: { fileKey: z.string().describe("The Figma file key") },
+    description:
+      "Get all comments on a Figma file via the REST API (Tier 2, cached)." + PLUGIN_HINT,
+    inputSchema: {
+      fileKey: z.string().describe("The Figma file key"),
+      ...forceRefreshField,
+    },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ fileKey }: { fileKey: string }) => {
+  async ({ fileKey, forceRefresh }: { fileKey: string; forceRefresh?: boolean }) => {
     try {
-      const data = await figmaGet<any>(`/files/${fileKey}/comments`);
-      return textResult(data.comments ?? []);
+      const res = await figmaGet<any>(`/files/${fileKey}/comments`, {
+        tier: 2,
+        ttlMs: TTL_FILE,
+        forceRefresh,
+      });
+      return restResult(res, res.data.comments ?? []);
     } catch (error) {
       return restError(error);
     }
@@ -233,7 +323,7 @@ server.registerTool(
   {
     title: "Post Figma Comment",
     description:
-      "Post a comment on a Figma file via the REST API. Optionally anchor it to a node. Requires FIGMA_TOKEN.",
+      "Post a comment on a Figma file via the REST API (Tier 2, not cached). Optionally anchor it to a node. Requires FIGMA_TOKEN.",
     inputSchema: {
       fileKey: z.string().describe("The Figma file key"),
       message: z.string().describe("The comment text"),
@@ -256,7 +346,7 @@ server.registerTool(
     try {
       const body: Record<string, unknown> = { message };
       if (nodeId) body.client_meta = { node_id: nodeId };
-      const data = await figmaPost<any>(`/files/${fileKey}/comments`, body);
+      const data = await figmaPost<any>(`/files/${fileKey}/comments`, body, 2);
       return textResult(data);
     } catch (error) {
       return restError(error);
@@ -269,7 +359,8 @@ server.registerTool(
   {
     title: "Get Figma Images",
     description:
-      "Render nodes from a Figma file as image URLs via the REST API (PNG/JPG/SVG/PDF). Requires FIGMA_TOKEN.",
+      "Render nodes from a Figma file as image URLs via the REST API (Tier 1, short-lived cache because rendered URLs expire). PNG/JPG/SVG/PDF." +
+      PLUGIN_HINT,
     inputSchema: {
       fileKey: z.string().describe("The Figma file key"),
       ids: z.string().describe("Comma-separated node IDs to render"),
@@ -283,6 +374,7 @@ server.registerTool(
         .max(4)
         .optional()
         .describe("Image scale (0.01-4); defaults to 1"),
+      ...forceRefreshField,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
@@ -291,21 +383,69 @@ server.registerTool(
     ids,
     format,
     scale,
+    forceRefresh,
   }: {
     fileKey: string;
     ids: string;
     format?: "png" | "jpg" | "svg" | "pdf";
     scale?: number;
+    forceRefresh?: boolean;
   }) => {
     try {
       const params = new URLSearchParams({ ids });
       params.set("format", format ?? "png");
       if (scale != null) params.set("scale", String(scale));
-      const data = await figmaGet<any>(`/images/${fileKey}?${params.toString()}`);
-      return textResult(data);
+      const res = await figmaGet<any>(`/images/${fileKey}?${params.toString()}`, {
+        tier: 1,
+        ttlMs: TTL_IMAGES,
+        forceRefresh,
+      });
+      return restResult(res, res.data);
     } catch (error) {
       return restError(error);
     }
+  }
+);
+
+server.registerTool(
+  "figma_cache_stats",
+  {
+    title: "Figma Cache Stats",
+    description:
+      "Report the REST disk cache location, entry count, and total size. Useful to confirm caching is reducing API calls.",
+    inputSchema: {},
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+  async () => {
+    const stats = getCacheStats();
+    return textResult({
+      ...stats,
+      totalKB: Math.round(stats.totalBytes / 1024),
+    });
+  }
+);
+
+server.registerTool(
+  "figma_cache_clear",
+  {
+    title: "Figma Cache Clear",
+    description:
+      "Clear the REST disk cache. Pass a fileKey to clear only that file's entries, or omit to wipe everything. Use this to force fresh data.",
+    inputSchema: {
+      fileKey: z
+        .string()
+        .optional()
+        .describe("Only clear cache entries for this file key; omit to clear all"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+  },
+  async ({ fileKey }: { fileKey?: string }) => {
+    const removed = clearDiskCache(fileKey);
+    return textResult(
+      `Cleared ${removed} cache ${removed === 1 ? "entry" : "entries"}${
+        fileKey ? ` for file ${fileKey}` : ""
+      }.`
+    );
   }
 );
 

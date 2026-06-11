@@ -2,7 +2,7 @@
 
 A local Model Context Protocol server that gives Cursor (or any MCP client) **both**:
 
-- **REST reads** — read *any* Figma file by key (document tree, nodes, components, styles, comments, image exports), with a small in-memory TTL cache. Works without opening the file in Figma.
+- **REST reads** — read *any* Figma file by key (document tree, nodes, components, styles, comments, image exports), hardened against Figma's rate limits with a persistent disk cache, per-tier throttling, 429/Retry-After backoff, request coalescing, and stale-while-revalidate. Works without opening the file in Figma.
 - **Canvas writes** — create/edit/delete nodes, set fills, auto-layout, components, text, and more, by driving the Figma Plugin API over a local WebSocket bridge.
 
 It is a hybrid of two approaches:
@@ -16,8 +16,8 @@ It is a hybrid of two approaches:
 Cursor (MCP host)
    stdio / JSON-RPC
 MCP server  (src/talk_to_figma_mcp/server.ts, Node + tsx)
-   REST + TTL cache  ->  Figma REST API            (read any file by key)
-   WebSocket client  ->  Relay (src/socket.ts) <-> Figma plugin  (write canvas)
+   REST + disk cache + throttle  ->  Figma REST API        (read any file by key)
+   WebSocket client  ->  Relay (src/socket.ts) <-> Figma plugin  (read open file + write canvas)
 ```
 
 Three independent processes connect over `ws://localhost:3055`:
@@ -27,6 +27,34 @@ Three independent processes connect over `ws://localhost:3055`:
 3. The **Figma plugin** ([`src/cursor_mcp_plugin`](src/cursor_mcp_plugin)) — its iframe UI owns the WebSocket (the plugin sandbox can't), and relays commands to the Figma scene.
 
 The MCP server and plugin pair up by joining the same **channel**.
+
+## Avoiding Figma rate limits
+
+Figma's REST API is rate-limited (leaky bucket, per-minute; e.g. Tier-1 file/image reads are 10-20/min on paid Dev/Full seats but only **6 per month** on Starter). This server minimizes how often it actually calls the API using a read hierarchy:
+
+```
+1. Plugin bridge   -> read the open file via the Plugin API   (0 REST calls, no limit, no token)
+2. Disk cache      -> serve a fresh cached response           (0 REST calls)
+3. Throttled fetch -> per-tier queue + coalesce duplicates    (1 REST call, then cached)
+   - on 429        -> wait Retry-After, exponential backoff
+   - on failure    -> serve stale cache with a [STALE] note
+```
+
+Practical effect: an agent that would otherwise make hundreds of reads makes one (or zero, when the file is open in Figma). REST tool results are prefixed with `[cache hit]` or `[STALE] ...` so you can see when no API call was made. Pass `forceRefresh: true` to any read tool (or use `figma_cache_clear`) to bypass the cache.
+
+### Caching / throttling env vars (all optional)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FIGMA_CACHE_DIR` | OS cache dir (`~/Library/Caches/figma-mcp`, `~/.cache/figma-mcp`, `%LOCALAPPDATA%/figma-mcp`) | Where cached responses are written |
+| `FIGMA_CACHE_TTL` | `24h` | TTL for file/node/component/style/comment reads (`30d`, `12h`, `30m`, `60s`, `500ms`) |
+| `FIGMA_IMAGE_CACHE_TTL` | `1h` | TTL for image renders (URLs expire, so kept short) |
+| `FIGMA_RPM_TIER1` | `10` | Max requests/min for Tier 1 (file, nodes, images) |
+| `FIGMA_RPM_TIER2` | `25` | Max requests/min for Tier 2 (comments) |
+| `FIGMA_RPM_TIER3` | `50` | Max requests/min for Tier 3 (components, styles) |
+| `FIGMA_MAX_RETRIES` | `5` | Max 429 retries before giving up (then stale cache is served if available) |
+
+Raise `FIGMA_CACHE_TTL` (e.g. `30d`) for stable/finished designs to make API calls extremely rare. Lower the `FIGMA_RPM_*` values to match a Starter seat's stricter limits.
 
 ## Requirements
 
@@ -73,17 +101,21 @@ A project-scoped equivalent is in [`.mcp.json`](.mcp.json). The `FIGMA_TOKEN` is
 
 ## Tools
 
-### REST read tools (need `FIGMA_TOKEN`, work on any file by key)
+### REST read tools (need `FIGMA_TOKEN`, work on any file by key, cached)
 
-| Tool | Purpose |
-|---|---|
-| `get_figma_file` | Document tree (defaults to `depth=2`; slimmed to name/lastModified/document) |
-| `get_figma_nodes` | Specific nodes by comma-separated IDs |
-| `get_figma_components` | Published components |
-| `get_figma_styles` | Color/text/effect/grid styles |
-| `get_figma_comments` | File comments |
-| `post_figma_comment` | Add a comment (optionally anchored to a node) |
-| `get_figma_images` | Render nodes to PNG/JPG/SVG/PDF URLs |
+All read tools accept `forceRefresh: true` to bypass the cache.
+
+| Tool | Tier | Purpose |
+|---|---|---|
+| `get_figma_file` | 1 | Document tree (defaults to `depth=2`; slimmed to name/lastModified/document) |
+| `get_figma_nodes` | 1 | Specific nodes by comma-separated IDs |
+| `get_figma_images` | 1 | Render nodes to PNG/JPG/SVG/PDF URLs (short cache) |
+| `get_figma_comments` | 2 | File comments |
+| `post_figma_comment` | 2 | Add a comment (optionally anchored to a node); not cached |
+| `get_figma_components` | 3 | Published components |
+| `get_figma_styles` | 3 | Color/text/effect/grid styles |
+| `figma_cache_stats` | - | Cache location, entry count, size |
+| `figma_cache_clear` | - | Clear cache (all, or by `fileKey`) |
 
 ### Canvas/plugin tools (need the relay + plugin running, plus `join_channel`)
 
@@ -95,6 +127,7 @@ A project-scoped equivalent is in [`.mcp.json`](.mcp.json). The `FIGMA_TOKEN` is
 npm run typecheck            # tsc --noEmit
 node scripts/relay-smoke.mjs # relay request/response round-trip
 node scripts/mcp-smoke.mjs   # boot server over stdio, list tools
+npx tsx scripts/cache-smoke.ts # cache hit, 429 backoff, coalescing, stale-while-revalidate
 ```
 
 For a full end-to-end check, set `FIGMA_TOKEN`, start the relay + plugin, `join_channel`, then call `get_figma_file` on a known key and `create_frame` followed by `set_fill_color`.
